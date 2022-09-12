@@ -1,0 +1,6 @@
+rdkit==2022.3.5
+openbabel-wheel==3.1.1.7
+pymongo==4.2.0
+ogb==1.3.4
+
+-r requirements-cuda.txt
