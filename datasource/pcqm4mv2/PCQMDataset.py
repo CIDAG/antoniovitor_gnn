@@ -1,11 +1,12 @@
+import math
 import shutil
-import time
 import torch
 from torch_geometric.data import (
     InMemoryDataset,
     download_url,
     extract_zip,
-    extract_tar
+    extract_tar,
+    extract_gz,
 )
 from rdkit import Chem
 from openbabel import pybel
@@ -22,7 +23,6 @@ from pathlib import Path
 from torch_geometric.utils import remove_self_loops
 from tqdm import tqdm
 import os
-from trie import Trie
 
 from utils import generate_file_md5
 
@@ -105,25 +105,6 @@ def get_atoms_positions(molecule):
     
     return positions
 
-def prepare_canonical_smiles(raw_dir):
-    df = pd.read_csv(Path(raw_dir) / 'data.csv.gz')
-    df = df.dropna(subset='homolumogap')
-
-    for i, row in tqdm(df.iterrows(), total=len(df.index)):
-        smiles = df.at[i, 'smiles']
-        df.at[i, 'smiles'] = Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=True)
-
-    df.to_csv(Path(raw_dir) / 'data-with-canonical-smiles.csv')
-
-def find_molecule_data(mol, df):
-    mol_without_hs = Chem.RemoveHs(mol)
-    canon_smiles = Chem.MolToSmiles(mol_without_hs, canonical=True)
-    row = df.loc[df['smiles'] == canon_smiles]
-
-    print(canon_smiles)
-    print(row)
-    return row.to_dict()
-
 def process_molecule(molecule, target_property):
     y = target_property
     positions = get_atoms_positions(molecule)
@@ -186,165 +167,99 @@ def process_molecule(molecule, target_property):
 
     return data
 
+def get_mol_idx(mol):
+    name = mol.GetProp("_Name")
+    idx = name[name.rfind('/')+1:-4]
+    return int(idx)
 
 ################################################################################
 # Main
 ################################################################################
-def process_dataset(raw_dir):
-    # check if property data was processed
-    if not os.path.exists(Path(raw_dir) / 'data-with-canonical-smiles.csv'):
-        prepare_canonical_smiles(raw_dir)
-    
-    # property dataframe
-    df = pd.read_csv(Path(raw_dir) / 'data-with-canonical-smiles.csv')
-    df.dropna()
-
-    # molecular geometry supplier
-    supplier = Chem.SDMolSupplier(str(Path(raw_dir) / 'pcqm4m-v2-train.sdf'), removeHs=False, sanitize=False)
-
-    # process dataset
-    dataset = []
-    for mol in supplier:
-        target_property = find_molecule_data(mol, df)
-        
-        # skips if target property doesn't exists
-        if target_property is None: continue
-
-        data = process_molecule(mol, target_property)
-        dataset.append(data)
-
-    return dataset
-
-
 class PCQMDataset(InMemoryDataset):
-    url = [
-        'https://dgl-data.s3-accelerate.amazonaws.com/dataset/OGB-LSC/pcqm4m-v2.zip',
-        'http://ogb-data.stanford.edu/data/lsc/pcqm4m-v2-train.sdf.tar.gz',
-    ]
+    properties_filename = Path('data.csv')
+    properties_url = 'https://dgl-data.s3-accelerate.amazonaws.com/dataset/OGB-LSC/pcqm4m-v2.zip'
+    
+    geometries_filename = Path('pcqm4m-v2-train.sdf')
+    geometries_url = 'http://ogb-data.stanford.edu/data/lsc/pcqm4m-v2-train.sdf.tar.gz'
+
+    _idx_list = None
 
     def __init__(self, root, transform=None, pre_transform=None, pre_filter=None):
         super().__init__(root, transform, pre_transform, pre_filter)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+
+    @property
+    def idx_list(self):
+        if self._idx_list is None:
+            source = Path(self.processed_dir) / 'idx_list.csv'
+            self._idx_list = pd.read_csv(source)
+        return self._idx_list
 
     @property
     def raw_file_names(self):
-        return ['data.csv.gz', 'pcqm4m-v2-train.sdf']
+        return [
+            self.properties_filename,
+            self.geometries_filename,
+        ]
 
     @property
     def processed_file_names(self):
-        return ['data.pt']
+        idx_list = self.idx_list
+        filenames = [f'data.{i}.pt' for i, idx in enumerate(idx_list)]
+        return filenames
+
+    def len(self):
+        return len(self.idx_list)
+
+    def get(self, idx):
+        data = torch.load(Path(self.processed_dir) / f'data.{idx}.pt')
+        return data
 
     def download(self):
-        # First download
-        path = download_url(self.url[0], self.raw_dir)
-        extract_zip(path, self.root)
-        os.unlink(path)
+        # Download properties file
+        if not os.path.exists(self.raw_dir / self.properties_filename):
+            print(f'Downloading properties file...')
+            path = download_url(self.properties_url, self.raw_dir, log=False)
+            extract_zip(path, self.raw_dir, log=False)
+            os.unlink(path)
 
-        # Move files
-        origin = Path(self.root) / 'pcqm4m-v2/raw/data.csv.gz'
-        destiny = Path(self.raw_dir) / 'data.csv.gz'
-        os.rename(origin, destiny)
-        shutil.rmtree(Path(self.root) / 'pcqm4m-v2')
+            # Move files
+            origin = Path(self.raw_dir) / 'pcqm4m-v2/raw/data.csv.gz'
+            destiny = Path(self.raw_dir) / 'data.csv.gz'
+            os.rename(origin, destiny)
+            shutil.rmtree(Path(self.raw_dir) / 'pcqm4m-v2')
 
-        # Second download
-        path = download_url(self.url[1], self.raw_dir)
-        if(generate_file_md5(path) != 'fd72bce606e7ddf36c2a832badeec6ab'):
-            raise ValueError('MD5 Hash does not match the original file')
-        extract_tar(path, self.raw_dir)
-        os.unlink(path)
+            # Extract data
+            origin = Path(self.raw_dir) / 'data.csv.gz'
+            destiny = Path(self.raw_dir) / 'data.csv'
+            extract_gz(origin, destiny, log=False)
+            os.unlink(origin)
+
+        # # Download geometries file
+        if not os.path.exists(self.raw_dir / self.geometries_filename):
+            print(f'Downloading geometries file...')
+            path = download_url(self.geometries_url, self.raw_dir)
+            if(generate_file_md5(path) != 'fd72bce606e7ddf36c2a832badeec6ab'):
+                raise ValueError('MD5 Hash does not match the original file')
+            extract_tar(path, self.raw_dir, log=False)
+            os.unlink(path)
 
     def process(self):
-        # Prepare file with valid molecules (with DFT geometry and property defined)
-        self.prepare_valid_molecules()
-
-
-        # dataset = process_dataset(self.raw_dir)
-        # torch.save(self.collate(dataset), self.processed_paths[0])
-    
-    def get_molecules_with_canonical_smiles(self):
-        source_path = Path(self.raw_dir) / 'data.csv.gz'
-        destination_path = Path(self.raw_dir) / 'data-with-canonical-smiles.csv'
-
-        # Returns cached fle if exists
-        if os.path.exists(destination_path):
-            return pd.read_csv(destination_path)
-
-        df = pd.read_csv(source_path)
-        df = df.dropna()
-
-        for i, row in tqdm(df.iterrows(), total=len(df.index)):
-            mol = Chem.MolFromSmiles(row['smiles'])
-            df.at[i, 'smiles'] = Chem.MolToSmiles(mol, canonical=True)
-
-        df.dropna()
-
-        # Caches results
-        df.to_csv(destination_path)
-
-        return df
-    
-    def get_valid_molecules(self, df):
-        source_path = str(Path(self.raw_dir) / 'pcqm4m-v2-train.sdf')
-        destination_path = Path(self.raw_dir) / 'valid_mols.csv'
-        
-        # Returns cached fle if exists
-        if os.path.exists(destination_path):
-            return pd.read_csv(destination_path)
-
-        print('Creating trie structure...')
-        data = []
-        for i, row in tqdm(df.iterrows(), total=len(df.index)):
-            item = [row['smiles'], (row['idx'],row['homolumogap'])]
-            data.append(item)
-        trie = Trie(data)
-
-        supplier = Chem.SDMolSupplier(source_path, removeHs=False, sanitize=False)
-
-        # Filter valid molecules
-        print('Filtering valid molecules...')
-        valid_mols = []
-        for mol in tqdm(supplier):
-            mol_without_hs = Chem.RemoveHs(mol)
-            canonical_smiles = Chem.MolToSmiles(mol_without_hs, canonical=True)
-            mol_data = trie.get(canonical_smiles)
-            if mol_data is not None:
-                idx, homolumogap = mol_data
-                valid_mols.append([idx, canonical_smiles, homolumogap])
-        
-        # Creating new dataframe
-        valid_df = pd.DataFrame(valid_mols, columns=['idx', 'smiles', 'homolumogap'])
-        valid_df['idx'] = range(len(valid_df))
-        valid_df.set_index('idx', inplace=True)
-
-        # Caches results
-        valid_df.to_csv(destination_path)
-
-        return valid_df
-
-    def create_data_files(self, df):
-        source_path = str(Path(self.raw_dir) / 'pcqm4m-v2-train.sdf')
         processed_path = Path(self.processed_dir)
-        supplier = Chem.SDMolSupplier(source_path, removeHs=False, sanitize=False)
+        prop_data = pd.read_csv(Path(self.raw_dir) / 'data.csv').to_numpy()
+        supplier = Chem.SDMolSupplier(
+            str(Path(self.raw_dir) / 'pcqm4m-v2-train.sdf'),
+            removeHs=False,
+            sanitize=False)
 
-        print('Creating data files...')
+        idx_list = []
         for i, mol in enumerate(tqdm(supplier)):
-            id = 0
-            if(i < id): continue
-            if(i > id): break
+            idx = get_mol_idx(mol)
+            idx_list.append(idx)
+            # homolumogap is at column 2
+            property = prop_data[idx][2]
+            if not math.isnan(property):
+                torch_data = process_molecule(idx, mol, property)
+                torch.save(torch_data, processed_path / (f'data.{i}.pt'))
 
-            data = find_molecule_data(mol, df)
-            torch_data = process_molecule(mol, data['homolumogap'])
-            idx = data['idx']
-            torch.save(torch_data, processed_path / (f'data.{idx}.pt'))
-
-
-
-    def prepare_valid_molecules(self):
-        # Generates canonical smiles for molecules
-        df_canonical_mol = self.get_molecules_with_canonical_smiles()
-
-        # Filter molecules with dft geometry
-        df = self.get_valid_molecules(df_canonical_mol)
-
-        # Creates SDF files for each molecules
-        self.create_data_files(df)
+        df = pd.DataFrame(idx_list, columns=['idx'])
+        df.to_csv(Path(self.processed_dir) / 'idx_list.csv')

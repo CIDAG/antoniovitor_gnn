@@ -1,5 +1,8 @@
 from pathlib import Path
 import sys
+from monitoring.log import FileLog
+
+from s2s_gnn import e2eGNN
 from datasource.pcqm4mv2.PCQMDataset import PCQMDataset
 import seed
 
@@ -11,21 +14,22 @@ def main(params):
     seed.run()
 
     # Parameters
-    dataset = params['dataset']
+    dataset_name = params['dataset']
     name = params['name']
     target_property = int(params['target_property'])
 
-    # temp
-    dataset_path = datasets_root / dataset / name
-    dataset = PCQMDataset(dataset_path)
+    # dataset
+    dataset_path = datasets_root / dataset_name / name
+    dataset = PCQMDataset(dataset_path).shuffle()
 
+    # directory for saving training
+    model_dir = Path(f'/saved_models/dataset-{dataset_name}-name={name}-property-{target_property}')
 
-    # dataset = datasets.get_dataset(dataset_name, dataset_version, target_property)
-    # print(dataset)
-    
+    # log
+    log = FileLog(model_dir / 'logs')
 
-
-
+    model = e2eGNN(dataset, model_dir, log)
+    model.train()
 
 def get_params():
     action = sys.argv[1]
